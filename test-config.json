@@ -1,0 +1,36 @@
+{
+  "example_configs": {
+    "basic_enable": {
+      "description": "基础启用配置（使用环境变量代理）",
+      "config": {
+        "enabled": true
+      }
+    },
+    "custom_proxy": {
+      "description": "指定代理服务器配置",
+      "config": {
+        "enabled": true,
+        "proxy_host": "proxy.example.com",
+        "proxy_port": 8080
+      }
+    },
+    "proxy_with_auth": {
+      "description": "带认证的代理配置",
+      "config": {
+        "enabled": true,
+        "proxy_host": "proxy.example.com",
+        "proxy_port": 8080,
+        "proxy_auth": {
+          "username": "proxy_user",
+          "password": "proxy_pass"
+        }
+      }
+    },
+    "disabled": {
+      "description": "禁用代理配置",
+      "config": {
+        "enabled": false
+      }
+    }
+  }
+}
