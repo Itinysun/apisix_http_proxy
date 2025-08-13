@@ -17,44 +17,27 @@
 
 local core = require("apisix.core")
 local http = require("resty.http")
-local tonumber = tonumber
-local os = os
-
-local plugin_name = "http-proxy"
+local ngx = ngx
 
 local schema = {
     type = "object",
     properties = {
         proxy_host = {
-            type = "string",
-            description = "代理服务器主机名或IP地址"
+            description = "代理服务器主机名或IP地址",
+            type = "string"
         },
         proxy_port = {
+            description = "代理服务器端口",
             type = "integer",
             minimum = 1,
             maximum = 65535,
-            description = "代理服务器端口"
         },
-        proxy_auth = {
-            type = "object",
-            properties = {
-                username = {
-                    type = "string",
-                    description = "代理认证用户名"
-                },
-                password = {
-                    type = "string",
-                    description = "代理认证密码"
-                }
-            },
-            additionalProperties = false,
-            description = "代理服务器认证信息（可选）"
-        }
     },
     required = {"proxy_host", "proxy_port"},
     additionalProperties = false,
-    description = "HTTP代理插件配置，必须提供proxy_host和proxy_port"
 }
+
+local plugin_name = "my-proxy"
 
 local _M = {
     version = 0.1,
@@ -67,122 +50,158 @@ function _M.check_schema(conf)
     return core.schema.check(schema, conf)
 end
 
-local function setup_proxy_headers(proxy_conf)
-    local headers = {}
-
-    if proxy_conf.proxy_auth and proxy_conf.proxy_auth.username and proxy_conf.proxy_auth.password then
-        local auth = ngx.encode_base64(proxy_conf.proxy_auth.username .. ":" .. proxy_conf.proxy_auth.password)
-        headers["Proxy-Authorization"] = "Basic " .. auth
-    end
-
-    headers["Proxy-Connection"] = "Keep-Alive"
-
-    return headers
-end
-
 function _M.access(conf, ctx)
-    core.log.info("HTTP代理插件被调用: host=", conf.proxy_host, ", port=", conf.proxy_port)
+    core.log.warn("=== my-proxy plugin started ===")
+    core.log.warn("my-proxy plugin called with host: ", conf.proxy_host, " port: ", conf.proxy_port)
     
-    local proxy_conf = {
-        host = conf.proxy_host,
-        port = conf.proxy_port,
-        proxy_auth = conf.proxy_auth
-    }
-
-    local upstream_node = ctx.picked_server
-    if not upstream_node then
-        core.log.error("无法获取上游服务节点信息")
+    -- 获取上游信息
+    local matched_route = ctx.matched_route
+    if not matched_route then
+        core.log.error("no matched route found")
         return
     end
+    core.log.warn("matched route found, id: ", matched_route.value.id or "unknown")
 
-    local upstream_host = upstream_node.host
-    local upstream_port = upstream_node.port or 80
+    local upstream = matched_route.value.upstream
+    if not upstream then
+        core.log.error("no upstream found")
+        return
+    end
+    core.log.warn("upstream found, type: ", upstream.type or "unknown", " scheme: ", upstream.scheme or "unknown")
 
+    -- 使用HTTP代理发起请求
     local httpc = http.new()
-    httpc:set_timeout(30000)
+    httpc:set_timeout(5000)  -- 减少超时时间
 
-    local ok, err = httpc:connect(proxy_conf.host, proxy_conf.port)
-    if not ok then
-        core.log.error("连接HTTP代理失败: ", err)
-        return
+    -- 设置代理选项
+    local proxy_options = {
+        http_proxy = "http://" .. conf.proxy_host .. ":" .. conf.proxy_port,
+        https_proxy = "http://" .. conf.proxy_host .. ":" .. conf.proxy_port,
+    }
+    httpc:set_proxy_options(proxy_options)
+
+    -- 获取目标服务器信息
+    local nodes = upstream.nodes
+    core.log.warn("nodes type: ", type(nodes))
+    if type(nodes) == "table" then
+        core.log.warn("nodes array length: ", #nodes)
+        local node_count = 0
+        for k, v in pairs(nodes) do
+            node_count = node_count + 1
+            core.log.warn("node key: ", k, " value type: ", type(v))
+            if node_count >= 3 then break end -- 只显示前3个
+        end
+    else
+        core.log.warn("nodes content: ", tostring(nodes))
     end
-
-    local proxy_headers = setup_proxy_headers(proxy_conf)
-
-    local connect_req = "CONNECT " .. upstream_host .. ":" .. upstream_port .. " HTTP/1.1\r\n"
-    connect_req = connect_req .. "Host: " .. upstream_host .. ":" .. upstream_port .. "\r\n"
-
-    for k, v in pairs(proxy_headers) do
-        connect_req = connect_req .. k .. ": " .. v .. "\r\n"
-    end
-
-    connect_req = connect_req .. "\r\n"
-
-    local bytes, send_err = httpc:send(connect_req)
-    if not bytes then
-        core.log.error("发送CONNECT请求失败: ", send_err)
-        httpc:close()
-        return
-    end
-
-    local line, recv_err = httpc:receive("*l")
-    if not line then
-        core.log.error("读取CONNECT响应失败: ", recv_err)
-        httpc:close()
-        return
-    end
-
-    local status_code = line:match("HTTP/%d%.%d (%d+)")
-    if not status_code or tonumber(status_code) ~= 200 then
-        core.log.error("HTTP代理CONNECT请求失败: ", line)
-        httpc:close()
-        return
-    end
-
-    repeat
-        line, recv_err = httpc:receive("*l")
-    until not line or line == ""
-
-    if recv_err and recv_err ~= "timeout" then
-        core.log.error("读取CONNECT响应头失败: ", recv_err)
-        httpc:close()
-        return
-    end
-
-    local sock = httpc.sock
-    if not sock then
-        core.log.error("无法获取HTTP代理socket")
-        httpc:close()
-        return
-    end
-
-    ctx.proxy_sock = sock
-    ctx.proxy_httpc = httpc
-
-    core.log.info("HTTP代理隧道建立成功: ", proxy_conf.host, ":", proxy_conf.port, " -> ", upstream_host, ":", upstream_port)
-end
-
-function _M.balancer(_, ctx)
-    if not ctx.proxy_sock then
-        return
-    end
-
-    local balancer = require "ngx.balancer"
-    local sock = ctx.proxy_sock
     
-    local ok, err = balancer.set_current_peer("unix:" .. sock:getfd())
-    if not ok then
-        core.log.error("设置代理socket失败: ", err)
+    local target_host, target_port
+    
+    if type(nodes) == "table" then
+        if #nodes > 0 then
+            -- 数组格式的nodes
+            core.log.warn("using array format nodes")
+            for i, node in ipairs(nodes) do
+                if type(node) == "table" then
+                    core.log.warn("checking node ", i, ": host=", node.host, " port=", node.port, " weight=", node.weight)
+                    if node.host and node.port then
+                        local weight = node.weight or 1
+                        if weight > 0 then
+                            target_host = node.host
+                            target_port = node.port
+                            core.log.warn("selected target: ", target_host, ":", target_port)
+                            break
+                        end
+                    end
+                else
+                    core.log.warn("checking node ", i, ": ", tostring(node))
+                end
+            end
+        else
+            -- 键值对格式的nodes
+            core.log.warn("using key-value format nodes")
+            for host_port, weight in pairs(nodes) do
+                local weight_str = type(weight) == "table" and "table" or tostring(weight)
+                core.log.warn("checking host_port: ", host_port, " (type: ", type(host_port), "), weight: ", weight_str)
+                if type(host_port) == "string" then
+                    local actual_weight = type(weight) == "table" and weight.weight or weight
+                    core.log.warn("actual_weight: ", actual_weight)
+                    if actual_weight and actual_weight > 0 then
+                        local host, port = host_port:match("([^:]+):?(%d*)")
+                        target_host = host
+                        target_port = tonumber(port) or 80
+                        core.log.warn("selected target from key-value: ", target_host, ":", target_port)
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    if not target_host then
+        core.log.error("no valid upstream node found")
         return
     end
     
-    balancer.set_more_tries(0)
-end
+    core.log.warn("final target selected: ", target_host, ":", target_port)
 
-function _M.log(_, ctx)
-    if ctx.proxy_httpc then
-        ctx.proxy_httpc:close()
+    -- 构建目标URL
+    local scheme = upstream.scheme or "http"
+    local target_url = scheme .. "://" .. target_host .. ":" .. target_port .. ngx.var.request_uri
+    core.log.warn("target_url: ", target_url)
+    
+    -- 获取请求方法和头部
+    local method = ngx.req.get_method()
+    local headers = ngx.req.get_headers()
+    
+    -- 读取请求体
+    ngx.req.read_body()
+    local body = ngx.req.get_body_data()
+    
+    core.log.warn("发起代理请求: ", method, " ", target_url)
+    
+    -- 通过代理发起请求
+    local res, err = httpc:request_uri(target_url, {
+        method = method,
+        body = body,
+        headers = headers,
+        keepalive_timeout = 5000,
+        keepalive_pool = 5,
+        ssl_verify = false
+    })
+    
+    -- 关闭连接以避免连接复用问题
+    httpc:close()
+    
+    if not res then
+        core.log.error("代理请求失败: ", err)
+        ngx.status = 502
+        ngx.say("代理请求失败: " .. (err or "unknown error"))
+        ngx.exit(502)
     end
+    
+    core.log.warn("代理请求成功，状态码: ", res.status)
+    
+    -- 设置响应状态码
+    ngx.status = res.status
+    
+    -- 设置响应头，排除可能导致问题的头部
+    for k, v in pairs(res.headers) do
+        local lower_k = string.lower(k)
+        if lower_k ~= "connection" 
+           and lower_k ~= "transfer-encoding" 
+           and lower_k ~= "content-length"
+           and lower_k ~= "keep-alive" then
+            ngx.header[k] = v
+        end
+    end
+    
+    -- 直接输出响应体并结束
+    if res.body then
+        ngx.print(res.body)
+    end
+    ngx.eof()
+    return
 end
 
 return _M
