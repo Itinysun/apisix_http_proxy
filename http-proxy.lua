@@ -41,7 +41,7 @@ local plugin_name = "my-proxy"
 
 local _M = {
     version = 0.1,
-    priority = 1000,
+    priority = 1,
     name = plugin_name,
     schema = schema,
 }
@@ -145,9 +145,28 @@ function _M.access(conf, ctx)
     
     core.log.warn("final target selected: ", target_host, ":", target_port)
 
-    -- 构建目标URL
+    -- 构建目标URL，使用重写后的URI和参数
     local scheme = upstream.scheme or "http"
-    local target_url = scheme .. "://" .. target_host .. ":" .. target_port .. ngx.var.request_uri
+    local rewritten_uri = ngx.var.uri
+    local args = ngx.var.args
+    
+    -- 如果没有args，尝试从原始请求中提取参数
+    if not args or args == "" then
+        local original_uri = ngx.var.request_uri
+        local question_pos = string.find(original_uri, "?")
+        if question_pos then
+            args = string.sub(original_uri, question_pos + 1)
+        end
+    end
+    
+    local full_uri = rewritten_uri
+    if args and args ~= "" then
+        full_uri = rewritten_uri .. "?" .. args
+    end
+    local target_url = scheme .. "://" .. target_host .. ":" .. target_port .. full_uri
+    core.log.warn("original request_uri: ", ngx.var.request_uri)
+    core.log.warn("rewritten uri: ", rewritten_uri)
+    core.log.warn("args: ", args or "nil")
     core.log.warn("target_url: ", target_url)
     
     -- 获取请求方法和头部
